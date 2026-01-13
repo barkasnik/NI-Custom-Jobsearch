@@ -1,6 +1,9 @@
 # app.py  (single-file Streamlit app)
-# NI Job Matcher (JobApplyNI + DWP Find a Job) with track-splitting: Ops / Sales / Tech
-# Sales tab can be Manager-only (default) or include all sales roles (toggle)
+# NI Job Matcher — TITLE-GATED tracks: Manager / Sales / IT
+# - Jobs are INCLUDED or EXCLUDED based on JOB TITLE ONLY (your key requirement)
+# - Description/snippet is used only for scoring AFTER title passes the gate
+# - Sales can be manager-only (default) or include all sales roles (toggle)
+#
 # Paste this entire file into GitHub as app.py
 
 import re
@@ -19,17 +22,19 @@ from bs4 import BeautifulSoup
 # App config
 # ----------------------------
 
-APP_TITLE = "NI Job Matcher (Ops / Sales / Tech)"
-BUILD = "2026-01-13 v8 (Tracks + Sales toggle)"
+APP_TITLE = "NI Job Matcher (Manager / Sales / IT)"
+BUILD = "2026-01-13 v9 (TITLE-only gating + Sales toggle)"
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/120.0.0.0 Safari/537.36"
 )
 
-REQ_TIMEOUT = 25  # seconds
+REQ_TIMEOUT = 25
 RETRIES = 2
 BACKOFF = 1.2
+
+TRACKS = ["Manager", "Sales", "IT"]
 
 STOPWORDS = {
     "a","an","and","are","as","at","be","by","for","from","has","have","if","in","into","is","it","its",
@@ -40,36 +45,119 @@ STOPWORDS = {
     "years","year","month","months","day","days",
 }
 
-TRACKS = ["Ops", "Sales", "Tech"]
-
+# ---------- CV skill buckets (for scoring) ----------
+# These are NOT used for inclusion/exclusion (title-only gating handles that).
 OPS_KWS = {
     "supervisor","housekeeping","clean","cleaning","hygiene","hotel","hospitality","rota","schedule","scheduling",
     "shift","team","training","inventory","stock","order","ordering","audit","quality","compliance","facilities",
-    "operations","operational","warehouse","logistics","stores","receiving","dispatch","customer","service","front",
-    "back","kitchen","catering","retail","assistant","coordinator","administrator","admin"
+    "operations","operational","warehouse","logistics","stores","receiving","dispatch","customer","service","retail",
+    "assistant","coordinator","administrator","admin","process","improvement","performance","record","records"
 }
 
 SALES_KWS = {
     "sales","sell","selling","business","development","bdm","account","accounts","client","clients","customer",
     "customers","crm","pipeline","prospecting","lead","leads","closing","negotiate","negotiation","marketing",
-    "commercial","revenue","target","targets","quota","portfolio","relationship","relationships"
+    "commercial","revenue","target","targets","quota","portfolio","relationship","relationships","broker","property"
 }
 
 TECH_KWS = {
     "python","javascript","typescript","html","css","react","node","api","sql","database","data","analytics",
     "developer","development","software","engineer","engineering","devops","cloud","aws","azure","git","github",
-    "vscode","automation","testing","qa","support","helpdesk","it","systems"
-}
-
-# Sales managerial filter keywords
-SALES_MANAGER_TITLES = {
-    "manager","sales manager","account manager","business development manager","bdm",
-    "store manager","assistant manager","team leader","lead","head","director","supervisor"
+    "vscode","automation","testing","qa","technical","systems","network","security","cyber"
 }
 
 
 # ----------------------------
-# HTTP helpers
+# TITLE-ONLY gating (your requirement)
+# ----------------------------
+
+# IMPORTANT:
+# - Avoid overly-generic single words that create nonsense matches (e.g. "support").
+# - Prefer phrases like "IT Support" or "Service Desk".
+IT_TITLE_PHRASES = {
+    "it support", "service desk", "helpdesk", "help desk", "desktop support",
+    "technical support", "1st line", "first line", "2nd line", "second line",
+    "software developer", "web developer", "front end", "frontend", "back end", "backend",
+    "data analyst", "business analyst", "systems analyst",
+    "network engineer", "cloud engineer", "devops", "cyber security", "cybersecurity",
+    "qa tester", "test analyst", "automation tester"
+}
+IT_TITLE_WORDS = {
+    "developer","programmer","engineer","technician","sysadmin","administrator",
+    "analyst","devops","cloud","security","cyber","network","database"
+}
+
+SALES_TITLE_PHRASES = {
+    "sales executive", "sales representative", "sales advisor", "sales consultant",
+    "account manager", "account executive",
+    "business development", "relationship manager", "client manager",
+    "estate agent", "lettings", "property manager", "broker"
+}
+SALES_TITLE_WORDS = {"sales","commercial","bdm","crm"}
+
+MANAGER_TITLE_PHRASES = {
+    "team leader", "shift leader", "duty manager", "assistant manager", "deputy manager",
+    "operations manager", "general manager", "store manager", "branch manager"
+}
+MANAGER_TITLE_WORDS = {"manager","supervisor","lead","leader","head","director"}
+
+
+def _title_has_phrase_or_word(title: str, phrases: set, words: set) -> bool:
+    t = (title or "").lower().strip()
+    if not t:
+        return False
+
+    # phrase check (substring)
+    for p in phrases:
+        if p in t:
+            return True
+
+    # word-boundary check (avoids "accountant" matching "account")
+    for w in words:
+        if re.search(rf"\b{re.escape(w)}\b", t):
+            return True
+
+    return False
+
+
+def classify_track_from_title(title: str) -> Optional[str]:
+    """
+    STRICT inclusion:
+    - We only classify by JOB TITLE.
+    - If title doesn't look like Manager/Sales/IT, return None (job is skipped).
+    """
+    # IT first (more distinctive)
+    if _title_has_phrase_or_word(title, IT_TITLE_PHRASES, IT_TITLE_WORDS):
+        return "IT"
+
+    # Sales second
+    if _title_has_phrase_or_word(title, SALES_TITLE_PHRASES, SALES_TITLE_WORDS):
+        return "Sales"
+
+    # Manager last
+    if _title_has_phrase_or_word(title, MANAGER_TITLE_PHRASES, MANAGER_TITLE_WORDS):
+        return "Manager"
+
+    return None
+
+
+def looks_sales_manager_title_only(title: str) -> bool:
+    """
+    Sales tab default is manager-only.
+    This MUST be title-based (per your requirement).
+    """
+    t = (title or "").lower()
+    # keep this intentionally tight
+    mgr_signals = {
+        "manager", "team leader", "lead", "head", "director", "supervisor",
+        "account manager", "sales manager", "business development manager", "bdm",
+        "store manager", "branch manager"
+    }
+    return any(s in t for s in mgr_signals)
+
+
+# ----------------------------
+# HTTP + text helpers
 # ----------------------------
 
 def http_get(url: str, params: Optional[dict] = None) -> requests.Response:
@@ -90,18 +178,14 @@ def http_get(url: str, params: Optional[dict] = None) -> requests.Response:
     raise last_err  # type: ignore
 
 
-# ----------------------------
-# Text helpers
-# ----------------------------
-
 def normalise_space(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip())
+
 
 def tokenise(text: str) -> List[str]:
     text = (text or "").lower()
     text = re.sub(r"[^a-z0-9\s]+", " ", text)
     parts = [p for p in text.split() if p and p not in STOPWORDS and len(p) > 2]
-    # ultra-light stemming
     out = []
     for w in parts:
         for suf in ("ing","ers","er","ed","es","s"):
@@ -111,61 +195,43 @@ def tokenise(text: str) -> List[str]:
         out.append(w)
     return out
 
+
 def binary_cosine(a: set, b: set) -> float:
     if not a or not b:
         return 0.0
     inter = len(a.intersection(b))
     return inter / math.sqrt(len(a) * len(b))
 
+
 def top_overlap_keywords(cv_tokens: set, job_tokens: set, k: int = 10) -> List[str]:
     overlaps = list(cv_tokens.intersection(job_tokens))
     overlaps.sort()
     return overlaps[:k]
 
-def classify_track(job_text: str) -> str:
-    toks = set(tokenise(job_text))
-    ops = len(toks & OPS_KWS)
-    sales = len(toks & SALES_KWS)
-    tech = len(toks & TECH_KWS)
-
-    # bias: tech terms are distinctive
-    if tech >= max(3, ops, sales):
-        return "Tech"
-    if sales >= ops and sales >= 2:
-        return "Sales"
-    return "Ops"
-
-def looks_sales_manager(title: str, text: str) -> bool:
-    t = (title + " " + text).lower()
-    return any(k in t for k in SALES_MANAGER_TITLES)
 
 def build_cv_profiles(cv_text: str) -> Dict[str, str]:
     """
-    Extract track-specific CV text so each track scores against relevant parts.
-    If a track ends up empty, fall back to full CV.
+    Build three CV views for scoring.
+    Note: inclusion is title-only; this is only for better scoring.
     """
     lines = [ln.strip() for ln in (cv_text or "").splitlines() if ln.strip()]
-    ops_lines, sales_lines, tech_lines = [], [], []
+    manager_lines, sales_lines, it_lines = [], [], []
 
     for ln in lines:
         toks = set(tokenise(ln))
         if toks & OPS_KWS:
-            ops_lines.append(ln)
+            manager_lines.append(ln)
         if toks & SALES_KWS:
             sales_lines.append(ln)
         if toks & TECH_KWS:
-            tech_lines.append(ln)
+            it_lines.append(ln)
 
+    full = (cv_text or "").strip()
     profiles = {
-        "Ops": "\n".join(ops_lines).strip(),
-        "Sales": "\n".join(sales_lines).strip(),
-        "Tech": "\n".join(tech_lines).strip(),
+        "Manager": "\n".join(manager_lines).strip() or full,
+        "Sales": "\n".join(sales_lines).strip() or full,
+        "IT": "\n".join(it_lines).strip() or full,
     }
-
-    for k in list(profiles.keys()):
-        if not profiles[k]:
-            profiles[k] = (cv_text or "").strip()
-
     return profiles
 
 
@@ -200,11 +266,10 @@ def parse_jobapply_list(html: str) -> List[Job]:
             continue
         title = normalise_space(a.get_text(" ", strip=True))
         href = a.get("href") or ""
-        if not title:
-            continue
-        if "VacancyDetail" not in href:
+        if not title or "VacancyDetail" not in href:
             continue
 
+        # gather nearby text for company/location/date
         container_text = []
         node = h2
         for _ in range(25):
@@ -250,10 +315,8 @@ def parse_jobapply_list(html: str) -> List[Job]:
             )
         )
 
-    dedup = {}
-    for j in jobs:
-        dedup[j.url] = j
-    return list(dedup.values())
+    return list({j.url: j for j in jobs}.values())
+
 
 def parse_jobapply_detail(html: str) -> str:
     soup = BeautifulSoup(html, "html.parser")
@@ -282,10 +345,12 @@ def parse_jobapply_detail(html: str) -> str:
 
     return normalise_space(" ".join(text_parts))[:2000]
 
+
 @st.cache_data(show_spinner=False, ttl=60 * 30)
 def fetch_jobapplyni(max_pages: int = 3, keyword: str = "") -> Tuple[List[Job], List[dict]]:
     jobs: List[Job] = []
     diagnostics = []
+
     for page in range(1, max_pages + 1):
         params = {"DoSearch": "true", "CurrentPage": str(page)}
         if keyword.strip():
@@ -303,13 +368,14 @@ def fetch_jobapplyni(max_pages: int = 3, keyword: str = "") -> Tuple[List[Job], 
         except Exception as e:
             diagnostics.append({"url": f"{JOBAPPLY_BASE}?{urlencode(params)}", "status": None, "entries": 0, "error": repr(e)})
 
-    dedup = {j.url: j for j in jobs}
-    return list(dedup.values()), diagnostics
+    return list({j.url: j for j in jobs}.values()), diagnostics
+
 
 @st.cache_data(show_spinner=False, ttl=60 * 30)
 def enrich_jobapplyni_details(jobs: List[Job], max_details: int = 25) -> Tuple[List[Job], List[dict]]:
     diagnostics = []
     out = []
+
     for idx, j in enumerate(jobs):
         if idx >= max_details:
             out.append(j)
@@ -327,16 +393,17 @@ def enrich_jobapplyni_details(jobs: List[Job], max_details: int = 25) -> Tuple[L
         except Exception as e:
             diagnostics.append({"url": j.url, "status": None, "error": repr(e)})
             out.append(j)
+
     return out, diagnostics
 
 
 # ----------------------------
-# Source 2: DWP Find a Job
+# Source 2: DWP Find a Job (NI filter)
 # ----------------------------
 
 DWP_BASE = "https://findajob.dwp.gov.uk"
 DWP_SEARCH = "https://findajob.dwp.gov.uk/search"
-DWP_LOC_NI = "86423"  # Northern Ireland location code
+DWP_LOC_NI = "86423"
 
 def parse_dwp_list(html: str) -> List[Job]:
     soup = BeautifulSoup(html, "html.parser")
@@ -395,13 +462,14 @@ def parse_dwp_list(html: str) -> List[Job]:
             )
         )
 
-    dedup = {j.url: j for j in jobs}
-    return list(dedup.values())
+    return list({j.url: j for j in jobs}.values())
+
 
 @st.cache_data(show_spinner=False, ttl=60 * 30)
 def fetch_dwp(max_pages: int = 2, q: str = "") -> Tuple[List[Job], List[dict]]:
     jobs: List[Job] = []
     diagnostics = []
+
     for page in range(1, max_pages + 1):
         params = {"loc": DWP_LOC_NI}
         if q.strip():
@@ -421,15 +489,19 @@ def fetch_dwp(max_pages: int = 2, q: str = "") -> Tuple[List[Job], List[dict]]:
         except Exception as e:
             diagnostics.append({"url": f"{DWP_SEARCH}?{urlencode(params)}", "status": None, "entries": 0, "error": repr(e)})
 
-    dedup = {j.url: j for j in jobs}
-    return list(dedup.values()), diagnostics
+    return list({j.url: j for j in jobs}.values()), diagnostics
 
 
 # ----------------------------
-# Matching by Track (Ops / Sales / Tech)
+# Matching (TITLE-gated tracks)
 # ----------------------------
 
-def match_jobs_by_track(cv_text: str, jobs: List[Job], include_non_manager_sales: bool) -> Dict[str, List[dict]]:
+def match_jobs_by_track(
+    cv_text: str,
+    jobs: List[Job],
+    include_non_manager_sales: bool
+) -> Dict[str, List[dict]]:
+
     cv_text = (cv_text or "").strip()
     profiles = build_cv_profiles(cv_text)
 
@@ -439,14 +511,18 @@ def match_jobs_by_track(cv_text: str, jobs: List[Job], include_non_manager_sales
     buckets: Dict[str, List[dict]] = {k: [] for k in TRACKS}
 
     for j in jobs:
+        # TITLE-ONLY gate (the big change)
+        track = classify_track_from_title(j.title)
+        if track is None:
+            continue
+
+        # Sales: manager-only unless toggled
+        if track == "Sales" and (not include_non_manager_sales) and (not looks_sales_manager_title_only(j.title)):
+            continue
+
+        # scoring text can include snippet now (since it passed the title gate)
         job_text = " ".join([j.title, j.company, j.location, j.snippet or ""])
         job_tokens = set(tokenise(job_text))
-
-        track = classify_track(job_text)
-
-        # Sales tab: manager roles only UNLESS user toggles on non-manager sales
-        if track == "Sales" and (not include_non_manager_sales) and (not looks_sales_manager(j.title, job_text)):
-            continue
 
         base_raw = binary_cosine(prof_tokens[track], job_tokens)
 
@@ -468,7 +544,7 @@ def match_jobs_by_track(cv_text: str, jobs: List[Job], include_non_manager_sales
             "Track": track,
         })
 
-    # Percentile-normalise inside each track so "top in track" looks strong
+    # Percentile-normalise within each track (so top results look like top results)
     for track, rows in buckets.items():
         n = len(rows)
         if n == 0:
@@ -481,11 +557,11 @@ def match_jobs_by_track(cv_text: str, jobs: List[Job], include_non_manager_sales
 
         for i, row in enumerate(rows):
             pct = ranks[i] / (n - 1) if n > 1 else 0.5
-            score = 55 + 40 * pct                        # 55..95 baseline
-            score += min(3.0, 10.0 * row["_title_bonus"]) # up to +3
+            score = 55 + 40 * pct                           # 55..95
+            score += min(3.0, 10.0 * row["_title_bonus"])    # up to +3
 
             overlap_count = 0 if not row["Why"] else len([x for x in row["Why"].split(",") if x.strip()])
-            score += min(2.0, 0.25 * overlap_count)       # up to +2
+            score += min(2.0, 0.25 * overlap_count)          # up to +2
 
             row["Score"] = int(max(35, min(98, round(score))))
             del row["_raw"]
@@ -505,8 +581,8 @@ st.title(APP_TITLE)
 st.caption(f"BUILD: {BUILD}")
 
 st.write(
-    "Splits results into **Ops**, **Sales**, and **Tech**. "
-    "Sales can be **manager-only (default)** or expanded to include all sales roles."
+    "This version is **strict**: it only includes jobs whose **titles** look like **Manager**, **Sales**, or **IT**. "
+    "So things like 'Diabetes Specialist Dietitian' will not appear unless the title matches your tracks."
 )
 
 with st.sidebar:
@@ -529,6 +605,7 @@ with st.sidebar:
     else:
         jp_pages, dwp_pages, jp_details = 5, 3, 35
 
+
 st.subheader("1) Paste CV text")
 cv_text = st.text_area(
     "Paste CV text here",
@@ -548,6 +625,7 @@ if run:
         jp_jobs, jp_diag = fetch_jobapplyni(max_pages=jp_pages, keyword=keyword_hint)
         dwp_jobs, dwp_diag = fetch_dwp(max_pages=dwp_pages, q=keyword_hint)
 
+        # Enrich JobApplyNI detail pages (better scoring, still title-gated for inclusion)
         jp_jobs_enriched, jp_detail_diag = enrich_jobapplyni_details(jp_jobs, max_details=jp_details)
 
         all_jobs = jp_jobs_enriched + dwp_jobs
@@ -563,7 +641,7 @@ if run:
                 dedup[key2] = j
         all_jobs = list(dedup.values())
 
-    with st.spinner("Matching CV to jobs (by track)…"):
+    with st.spinner("Matching CV to jobs (TITLE-gated tracks)…"):
         buckets = match_jobs_by_track(cv_text, all_jobs, include_non_manager_sales=include_non_manager_sales)
         for t in buckets:
             buckets[t] = [m for m in buckets[t] if m["Score"] >= min_score]
@@ -579,15 +657,17 @@ if run:
                 if track == "Sales" and (not include_non_manager_sales):
                     st.info("No sales-manager roles above your minimum score. Turn on ‘Sales: include non-manager roles’ to widen.")
                 else:
-                    st.info("No results above your minimum score right now. Try lowering it or removing keyword filter.")
+                    st.info("No results above your minimum score. Try lowering it or removing the keyword filter.")
                 continue
 
             for m in rows[:60]:
                 left, right = st.columns([4, 1])
                 with left:
                     st.markdown(f"### {m['Title']}")
-                    st.write(f"**{m['Company']}** — {m['Location']}  \n"
-                             f"*{m['Source']}* • {m['Date']}")
+                    st.write(
+                        f"**{m['Company']}** — {m['Location']}  \n"
+                        f"*{m['Source']}* • {m['Date']}"
+                    )
                     if m.get("Why"):
                         st.caption(f"Overlap keywords: {m['Why']}")
                     st.link_button("Open job", m["URL"])

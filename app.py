@@ -1,10 +1,14 @@
+# app.py  (single-file Streamlit app)
+# NI Job Matcher (JobApplyNI + DWP Find a Job) with track-splitting: Ops / Sales / Tech
+# Sales tab can be Manager-only (default) or include all sales roles (toggle)
+# Paste this entire file into GitHub as app.py
+
 import re
 import time
 import math
-import hashlib
 from dataclasses import dataclass
 from typing import List, Dict, Tuple, Optional
-from urllib.parse import urlencode, quote_plus, urljoin
+from urllib.parse import urlencode, urljoin
 
 import requests
 import streamlit as st
@@ -12,10 +16,11 @@ from bs4 import BeautifulSoup
 
 
 # ----------------------------
-# Basics
+# App config
 # ----------------------------
 
-APP_TITLE = "NI Job Matcher (JobApplyNI + Find a Job)"
+APP_TITLE = "NI Job Matcher (Ops / Sales / Tech)"
+BUILD = "2026-01-13 v8 (Tracks + Sales toggle)"
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -35,6 +40,38 @@ STOPWORDS = {
     "years","year","month","months","day","days",
 }
 
+TRACKS = ["Ops", "Sales", "Tech"]
+
+OPS_KWS = {
+    "supervisor","housekeeping","clean","cleaning","hygiene","hotel","hospitality","rota","schedule","scheduling",
+    "shift","team","training","inventory","stock","order","ordering","audit","quality","compliance","facilities",
+    "operations","operational","warehouse","logistics","stores","receiving","dispatch","customer","service","front",
+    "back","kitchen","catering","retail","assistant","coordinator","administrator","admin"
+}
+
+SALES_KWS = {
+    "sales","sell","selling","business","development","bdm","account","accounts","client","clients","customer",
+    "customers","crm","pipeline","prospecting","lead","leads","closing","negotiate","negotiation","marketing",
+    "commercial","revenue","target","targets","quota","portfolio","relationship","relationships"
+}
+
+TECH_KWS = {
+    "python","javascript","typescript","html","css","react","node","api","sql","database","data","analytics",
+    "developer","development","software","engineer","engineering","devops","cloud","aws","azure","git","github",
+    "vscode","automation","testing","qa","support","helpdesk","it","systems"
+}
+
+# Sales managerial filter keywords
+SALES_MANAGER_TITLES = {
+    "manager","sales manager","account manager","business development manager","bdm",
+    "store manager","assistant manager","team leader","lead","head","director","supervisor"
+}
+
+
+# ----------------------------
+# HTTP helpers
+# ----------------------------
+
 def http_get(url: str, params: Optional[dict] = None) -> requests.Response:
     headers = {
         "User-Agent": USER_AGENT,
@@ -53,9 +90,12 @@ def http_get(url: str, params: Optional[dict] = None) -> requests.Response:
     raise last_err  # type: ignore
 
 
+# ----------------------------
+# Text helpers
+# ----------------------------
+
 def normalise_space(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip())
-
 
 def tokenise(text: str) -> List[str]:
     text = (text or "").lower()
@@ -71,60 +111,67 @@ def tokenise(text: str) -> List[str]:
         out.append(w)
     return out
 
-
-def split_into_chunks(cv_text: str) -> List[str]:
-    """
-    We deliberately *don't* require perfect headings.
-    We split by blank lines and also by long lines that look like role headers.
-    """
-    cv_text = (cv_text or "").strip()
-    if not cv_text:
-        return []
-    blocks = [b.strip() for b in re.split(r"\n\s*\n+", cv_text) if b.strip()]
-    # further split huge blocks
-    chunks = []
-    for b in blocks:
-        if len(b) < 800:
-            chunks.append(b)
-        else:
-            # split on sentences-ish to make match more "aspect based"
-            parts = re.split(r"(?<=[.!?])\s+(?=[A-Z0-9])", b)
-            buf = []
-            total = 0
-            for p in parts:
-                buf.append(p)
-                total += len(p)
-                if total >= 500:
-                    chunks.append(" ".join(buf).strip())
-                    buf, total = [], 0
-            if buf:
-                chunks.append(" ".join(buf).strip())
-    return chunks[:30]  # hard cap
-
-
 def binary_cosine(a: set, b: set) -> float:
     if not a or not b:
         return 0.0
     inter = len(a.intersection(b))
     return inter / math.sqrt(len(a) * len(b))
 
-
-def humanise_score(raw: float, title_bonus: float = 0.0) -> int:
-    """
-    Map raw similarity (0..1) into a human-looking 40..95-ish score.
-    We keep it honest-ish (low raw -> still not "0", but won't hit 90+).
-    """
-    raw = max(0.0, min(1.0, raw))
-    score = 35 + 60 * (raw ** 0.55)  # 35..95
-    score += 7 * max(0.0, min(1.0, title_bonus))
-    return int(max(35, min(98, round(score))))
-
-
-def top_overlap_keywords(cv_tokens: set, job_tokens: set, k: int = 8) -> List[str]:
+def top_overlap_keywords(cv_tokens: set, job_tokens: set, k: int = 10) -> List[str]:
     overlaps = list(cv_tokens.intersection(job_tokens))
     overlaps.sort()
     return overlaps[:k]
 
+def classify_track(job_text: str) -> str:
+    toks = set(tokenise(job_text))
+    ops = len(toks & OPS_KWS)
+    sales = len(toks & SALES_KWS)
+    tech = len(toks & TECH_KWS)
+
+    # bias: tech terms are distinctive
+    if tech >= max(3, ops, sales):
+        return "Tech"
+    if sales >= ops and sales >= 2:
+        return "Sales"
+    return "Ops"
+
+def looks_sales_manager(title: str, text: str) -> bool:
+    t = (title + " " + text).lower()
+    return any(k in t for k in SALES_MANAGER_TITLES)
+
+def build_cv_profiles(cv_text: str) -> Dict[str, str]:
+    """
+    Extract track-specific CV text so each track scores against relevant parts.
+    If a track ends up empty, fall back to full CV.
+    """
+    lines = [ln.strip() for ln in (cv_text or "").splitlines() if ln.strip()]
+    ops_lines, sales_lines, tech_lines = [], [], []
+
+    for ln in lines:
+        toks = set(tokenise(ln))
+        if toks & OPS_KWS:
+            ops_lines.append(ln)
+        if toks & SALES_KWS:
+            sales_lines.append(ln)
+        if toks & TECH_KWS:
+            tech_lines.append(ln)
+
+    profiles = {
+        "Ops": "\n".join(ops_lines).strip(),
+        "Sales": "\n".join(sales_lines).strip(),
+        "Tech": "\n".join(tech_lines).strip(),
+    }
+
+    for k in list(profiles.keys()):
+        if not profiles[k]:
+            profiles[k] = (cv_text or "").strip()
+
+    return profiles
+
+
+# ----------------------------
+# Data model
+# ----------------------------
 
 @dataclass
 class Job:
@@ -138,54 +185,48 @@ class Job:
 
 
 # ----------------------------
-# Source 1: JobApplyNI (NI Job Centre Online)
+# Source 1: JobApplyNI
 # ----------------------------
 
 JOBAPPLY_BASE = "https://www.jobapplyni.com/"
-JOBAPPLY_DETAIL_PREFIX = "https://www.jobapplyni.com/Vacancy/VacancyDetail"
 
 def parse_jobapply_list(html: str) -> List[Job]:
     soup = BeautifulSoup(html, "html.parser")
-
-    # job titles appear as H2 with a link (from the page structure)
     jobs: List[Job] = []
 
-    # Heuristic: titles are in <h2> tags on results pages
     for h2 in soup.find_all(["h2", "h3"]):
         a = h2.find("a")
         if not a:
             continue
         title = normalise_space(a.get_text(" ", strip=True))
         href = a.get("href") or ""
-        if not title or "Return to job search" in title:
+        if not title:
             continue
         if "VacancyDetail" not in href:
             continue
 
-        # The listing page presents a predictable set of fields after each header,
-        # but HTML structure can vary; we walk forward a bit.
         container_text = []
         node = h2
         for _ in range(25):
             node = node.find_next()
             if not node:
                 break
-            if node.name in ("h2","h3"):
+            if node.name in ("h2", "h3"):
                 break
             txt = normalise_space(node.get_text(" ", strip=True))
             if txt:
                 container_text.append(txt)
 
         blob = " | ".join(container_text)
-        # Extract simple fields via patterns we saw on the site
+
         def extract_after(label: str) -> str:
             m = re.search(rf"{re.escape(label)}\s*\|\s*([^|]+)", blob, re.IGNORECASE)
             return normalise_space(m.group(1)) if m else ""
 
         company = ""
-        # Often scheme/employer is a line right after title; we take first meaningful.
         for t in container_text[:6]:
-            if t.lower() not in ("find out more",) and not t.lower().startswith("vacancy id"):
+            low = t.lower()
+            if low and low not in ("find out more",) and not low.startswith("vacancy id"):
                 company = t
                 break
 
@@ -195,8 +236,6 @@ def parse_jobapply_list(html: str) -> List[Job]:
             location = normalise_space(f"{location} ({area})") if location else area
 
         date = extract_after("Closing date") or ""
-        snippet = ""  # list page doesn't include a true snippet; we fill later optionally
-
         url = urljoin(JOBAPPLY_BASE, href)
 
         jobs.append(
@@ -207,64 +246,53 @@ def parse_jobapply_list(html: str) -> List[Job]:
                 location=location or "Northern Ireland",
                 date=date,
                 url=url,
-                snippet=snippet,
+                snippet="",
             )
         )
 
-    # Dedupe by URL
     dedup = {}
     for j in jobs:
         dedup[j.url] = j
     return list(dedup.values())
 
-
 def parse_jobapply_detail(html: str) -> str:
     soup = BeautifulSoup(html, "html.parser")
-
-    # Job description sits under a heading "Job description"
     text_parts = []
-    # Try grabbing main content around h3/h4
+
     for header in soup.find_all(["h3", "h4"]):
         if "job description" in header.get_text(" ", strip=True).lower():
-            # collect next few paragraphs/lists
             node = header
             for _ in range(60):
                 node = node.find_next()
                 if not node:
                     break
-                if node.name in ("h1","h2","h3") and node.get_text(strip=True):
+                if node.name in ("h1", "h2", "h3") and node.get_text(strip=True):
                     break
-                if node.name in ("p","li"):
+                if node.name in ("p", "li"):
                     t = normalise_space(node.get_text(" ", strip=True))
                     if t:
                         text_parts.append(t)
             break
 
-    # Fallback: use all list items + paragraphs on page
     if not text_parts:
-        for node in soup.find_all(["p","li"]):
+        for node in soup.find_all(["p", "li"]):
             t = normalise_space(node.get_text(" ", strip=True))
             if t:
                 text_parts.append(t)
 
     return normalise_space(" ".join(text_parts))[:2000]
 
-
 @st.cache_data(show_spinner=False, ttl=60 * 30)
 def fetch_jobapplyni(max_pages: int = 3, keyword: str = "") -> Tuple[List[Job], List[dict]]:
     jobs: List[Job] = []
     diagnostics = []
     for page in range(1, max_pages + 1):
-        params = {
-            "DoSearch": "true",
-            "CurrentPage": str(page),
-        }
+        params = {"DoSearch": "true", "CurrentPage": str(page)}
         if keyword.strip():
             params["keyword"] = keyword.strip()
 
-        url = JOBAPPLY_BASE
         try:
-            r = http_get(url, params=params)
+            r = http_get(JOBAPPLY_BASE, params=params)
             status = r.status_code
             if status != 200:
                 diagnostics.append({"url": r.url, "status": status, "entries": 0, "error": f"HTTP {status}"})
@@ -273,18 +301,13 @@ def fetch_jobapplyni(max_pages: int = 3, keyword: str = "") -> Tuple[List[Job], 
             diagnostics.append({"url": r.url, "status": status, "entries": len(page_jobs), "error": ""})
             jobs.extend(page_jobs)
         except Exception as e:
-            diagnostics.append({"url": f"{url}?{urlencode(params)}", "status": None, "entries": 0, "error": repr(e)})
+            diagnostics.append({"url": f"{JOBAPPLY_BASE}?{urlencode(params)}", "status": None, "entries": 0, "error": repr(e)})
 
-    # Dedup
     dedup = {j.url: j for j in jobs}
     return list(dedup.values()), diagnostics
 
-
 @st.cache_data(show_spinner=False, ttl=60 * 30)
 def enrich_jobapplyni_details(jobs: List[Job], max_details: int = 25) -> Tuple[List[Job], List[dict]]:
-    """
-    Fetch details for top N JobApplyNI jobs to get real text for matching.
-    """
     diagnostics = []
     out = []
     for idx, j in enumerate(jobs):
@@ -308,20 +331,17 @@ def enrich_jobapplyni_details(jobs: List[Job], max_details: int = 25) -> Tuple[L
 
 
 # ----------------------------
-# Source 2: DWP "Find a job" (filtered to Northern Ireland)
+# Source 2: DWP Find a Job
 # ----------------------------
 
 DWP_BASE = "https://findajob.dwp.gov.uk"
 DWP_SEARCH = "https://findajob.dwp.gov.uk/search"
-
-# Northern Ireland location id observed on the site
-DWP_LOC_NI = "86423"
+DWP_LOC_NI = "86423"  # Northern Ireland location code
 
 def parse_dwp_list(html: str) -> List[Job]:
     soup = BeautifulSoup(html, "html.parser")
     jobs: List[Job] = []
 
-    # On Find a job, each result is typically an h3 with a link
     for h3 in soup.find_all("h3"):
         a = h3.find("a")
         if not a:
@@ -331,9 +351,7 @@ def parse_dwp_list(html: str) -> List[Job]:
         if not title or "/details/" not in href:
             continue
 
-        # grab the result block: next siblings contain the meta bullets + snippet
         meta = []
-        snippet = ""
         node = h3
         for _ in range(40):
             node = node.find_next()
@@ -342,39 +360,22 @@ def parse_dwp_list(html: str) -> List[Job]:
             if node.name == "h3":
                 break
             txt = normalise_space(node.get_text(" ", strip=True))
-            if not txt:
-                continue
-            # stop on "Save ... job"
-            if txt.lower().startswith("save ") and txt.lower().endswith(" job to favourites"):
-                continue
-            # meta bullet lines often have '*' in rendered view but in HTML they're list items
-            meta.append(txt)
+            if txt:
+                meta.append(txt)
             if len(meta) >= 12:
                 break
 
-        blob = " | ".join(meta)
-
-        # very lightweight extraction:
-        # expected order: date, employer-location, salary(optional), contract, hours, snippet...
-        date = ""
+        date = meta[0] if meta else ""
         company = ""
         location = ""
-        contract = ""
-
-        # Try to infer fields from first few meta items
-        # A common pattern is: [date] [employer - location] [salary?] [contract] [hours]
-        if meta:
-            date = meta[0]
         if len(meta) >= 2:
             company_loc = meta[1]
             if " - " in company_loc:
                 company, location = [normalise_space(x) for x in company_loc.split(" - ", 1)]
             else:
                 company = company_loc
-        if len(meta) >= 4:
-            contract = meta[2] if "£" not in meta[2] else meta[3]
 
-        # snippet: take the longest meta item beyond first few
+        snippet = ""
         candidates = meta[3:]
         if candidates:
             snippet = max(candidates, key=len)
@@ -396,7 +397,6 @@ def parse_dwp_list(html: str) -> List[Job]:
 
     dedup = {j.url: j for j in jobs}
     return list(dedup.values())
-
 
 @st.cache_data(show_spinner=False, ttl=60 * 30)
 def fetch_dwp(max_pages: int = 2, q: str = "") -> Tuple[List[Job], List[dict]]:
@@ -426,52 +426,74 @@ def fetch_dwp(max_pages: int = 2, q: str = "") -> Tuple[List[Job], List[dict]]:
 
 
 # ----------------------------
-# Matching
+# Matching by Track (Ops / Sales / Tech)
 # ----------------------------
 
-def match_jobs(cv_text: str, jobs: List[Job]) -> List[dict]:
-    cv_text = cv_text or ""
-    chunks = split_into_chunks(cv_text)
-    cv_tokens_full = set(tokenise(cv_text))
-    chunk_tokens = [set(tokenise(c)) for c in chunks if c.strip()]
+def match_jobs_by_track(cv_text: str, jobs: List[Job], include_non_manager_sales: bool) -> Dict[str, List[dict]]:
+    cv_text = (cv_text or "").strip()
+    profiles = build_cv_profiles(cv_text)
 
-    results = []
+    prof_tokens = {k: set(tokenise(v)) for k, v in profiles.items()}
+    full_tokens = set(tokenise(cv_text))
+
+    buckets: Dict[str, List[dict]] = {k: [] for k in TRACKS}
+
     for j in jobs:
         job_text = " ".join([j.title, j.company, j.location, j.snippet or ""])
         job_tokens = set(tokenise(job_text))
 
-        full_raw = binary_cosine(cv_tokens_full, job_tokens)
+        track = classify_track(job_text)
 
-        best_chunk_raw = 0.0
-        if chunk_tokens:
-            best_chunk_raw = max(binary_cosine(ct, job_tokens) for ct in chunk_tokens)
+        # Sales tab: manager roles only UNLESS user toggles on non-manager sales
+        if track == "Sales" and (not include_non_manager_sales) and (not looks_sales_manager(j.title, job_text)):
+            continue
 
-        # title bonus (helps “Housekeeping Supervisor” find supervisor roles, etc.)
+        base_raw = binary_cosine(prof_tokens[track], job_tokens)
+
         title_tokens = set(tokenise(j.title))
-        title_bonus = binary_cosine(cv_tokens_full, title_tokens)
+        title_bonus = binary_cosine(full_tokens, title_tokens)
 
-        raw = max(full_raw, best_chunk_raw)
-        # slightly weight the title in as well
-        raw = min(1.0, (0.82 * raw) + (0.18 * title_bonus))
+        raw = min(1.0, 0.85 * base_raw + 0.15 * title_bonus)
 
-        score = humanise_score(raw, title_bonus=title_bonus)
-        why = ", ".join(top_overlap_keywords(cv_tokens_full, job_tokens, k=8))
+        buckets[track].append({
+            "_raw": raw,
+            "_title_bonus": title_bonus,
+            "Title": j.title,
+            "Company": j.company,
+            "Location": j.location,
+            "Date": j.date,
+            "Source": j.source,
+            "URL": j.url,
+            "Why": ", ".join(top_overlap_keywords(prof_tokens[track], job_tokens, k=10)),
+            "Track": track,
+        })
 
-        results.append(
-            {
-                "Score": score,
-                "Title": j.title,
-                "Company": j.company,
-                "Location": j.location,
-                "Date": j.date,
-                "Source": j.source,
-                "Why": why,
-                "URL": j.url,
-            }
-        )
+    # Percentile-normalise inside each track so "top in track" looks strong
+    for track, rows in buckets.items():
+        n = len(rows)
+        if n == 0:
+            continue
 
-    results.sort(key=lambda x: (x["Score"], x["Date"]), reverse=True)
-    return results
+        idx_sorted = sorted(range(n), key=lambda i: rows[i]["_raw"])
+        ranks = [0] * n
+        for r, idx in enumerate(idx_sorted):
+            ranks[idx] = r
+
+        for i, row in enumerate(rows):
+            pct = ranks[i] / (n - 1) if n > 1 else 0.5
+            score = 55 + 40 * pct                        # 55..95 baseline
+            score += min(3.0, 10.0 * row["_title_bonus"]) # up to +3
+
+            overlap_count = 0 if not row["Why"] else len([x for x in row["Why"].split(",") if x.strip()])
+            score += min(2.0, 0.25 * overlap_count)       # up to +2
+
+            row["Score"] = int(max(35, min(98, round(score))))
+            del row["_raw"]
+            del row["_title_bonus"]
+
+        rows.sort(key=lambda x: (x["Score"], x["Date"]), reverse=True)
+
+    return buckets
 
 
 # ----------------------------
@@ -480,63 +502,60 @@ def match_jobs(cv_text: str, jobs: List[Job]) -> List[dict]:
 
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 st.title(APP_TITLE)
+st.caption(f"BUILD: {BUILD}")
 
-st.caption(
-    "Key-free sources. Designed to actually return NI jobs on Streamlit Cloud. "
-    "Matches your CV both as a whole and by chunks (roles/paragraphs), so mixed experience doesn't zero you out."
+st.write(
+    "Splits results into **Ops**, **Sales**, and **Tech**. "
+    "Sales can be **manager-only (default)** or expanded to include all sales roles."
 )
 
 with st.sidebar:
     st.subheader("Search")
-    keyword_hint = st.text_input("Optional keyword filter (leave blank for broad search)", value="")
-    breadth = st.selectbox("Search breadth", ["Fast (≈60 jobs)", "Balanced (≈120 jobs)", "Wide (≈200+ jobs)"], index=1)
-    min_score = st.slider("Minimum match score", min_value=35, max_value=95, value=45, step=1)
+    keyword_hint = st.text_input("Optional keyword filter (blank = broad search)", value="")
+    breadth = st.selectbox("Search breadth", ["Fast", "Balanced", "Wide"], index=1)
+    min_score = st.slider("Minimum match score", min_value=35, max_value=95, value=50, step=1)
+
+    st.divider()
+    st.subheader("Sales options")
+    include_non_manager_sales = st.checkbox("Sales: include non-manager roles", value=False)
+
+    st.divider()
     show_diagnostics = st.checkbox("Show diagnostics", value=False)
 
-    if breadth.startswith("Fast"):
+    if breadth == "Fast":
         jp_pages, dwp_pages, jp_details = 2, 1, 18
-    elif breadth.startswith("Balanced"):
+    elif breadth == "Balanced":
         jp_pages, dwp_pages, jp_details = 3, 2, 25
     else:
         jp_pages, dwp_pages, jp_details = 5, 3, 35
 
-st.subheader("1) Add your CV")
-tab1, tab2 = st.tabs(["Paste CV text", "Upload a .txt file"])
-
-cv_text = ""
-with tab1:
-    cv_text = st.text_area(
-        "Paste your CV here",
-        height=260,
-        placeholder="Paste CV text… (PDF/DOCX not supported in this ultra-simple build — convert to text first.)",
-    )
-
-with tab2:
-    up = st.file_uploader("Upload a plain text CV (.txt)", type=["txt"])
-    if up is not None:
-        cv_text = up.read().decode("utf-8", errors="ignore")
+st.subheader("1) Paste CV text")
+cv_text = st.text_area(
+    "Paste CV text here",
+    height=280,
+    placeholder="Paste your CV text…",
+)
 
 st.subheader("2) Run search")
 run = st.button("Find matching NI jobs", type="primary", use_container_width=True)
 
 if run:
     if not cv_text.strip():
-        st.error("Please paste or upload CV text first.")
+        st.error("Please paste your CV text first.")
         st.stop()
 
     with st.spinner("Fetching jobs…"):
         jp_jobs, jp_diag = fetch_jobapplyni(max_pages=jp_pages, keyword=keyword_hint)
         dwp_jobs, dwp_diag = fetch_dwp(max_pages=dwp_pages, q=keyword_hint)
 
-        # enrich JobApplyNI with real descriptions (improves matching a LOT)
         jp_jobs_enriched, jp_detail_diag = enrich_jobapplyni_details(jp_jobs, max_details=jp_details)
 
         all_jobs = jp_jobs_enriched + dwp_jobs
 
-        # Dedup across sources by URL (and by title+company if needed)
+        # Dedup across sources by URL
         dedup = {}
         for j in all_jobs:
-            key = j.url.strip().lower()
+            key = (j.url or "").strip().lower()
             if key:
                 dedup[key] = j
             else:
@@ -544,29 +563,37 @@ if run:
                 dedup[key2] = j
         all_jobs = list(dedup.values())
 
-    with st.spinner("Matching CV to jobs…"):
-        matches = match_jobs(cv_text, all_jobs)
-        matches = [m for m in matches if m["Score"] >= min_score]
+    with st.spinner("Matching CV to jobs (by track)…"):
+        buckets = match_jobs_by_track(cv_text, all_jobs, include_non_manager_sales=include_non_manager_sales)
+        for t in buckets:
+            buckets[t] = [m for m in buckets[t] if m["Score"] >= min_score]
 
-    st.subheader(f"Results ({len(matches)})")
-    if not matches:
-        st.warning(
-            "No matches above your minimum score. Try lowering the minimum score slider, "
-            "or leave keyword filter blank for a broader pull."
-        )
-    else:
-        for m in matches[:60]:
-            left, right = st.columns([4, 1])
-            with left:
-                st.markdown(f"### {m['Title']}")
-                st.write(f"**{m['Company']}** — {m['Location']}  \n"
-                         f"*{m['Source']}* • {m['Date']}")
-                if m["Why"]:
-                    st.caption(f"Overlap keywords: {m['Why']}")
-                st.link_button("Open job", m["URL"])
-            with right:
-                st.metric("Match", f"{m['Score']}%")
-            st.divider()
+    tabs = st.tabs(TRACKS)
+
+    for tab, track in zip(tabs, TRACKS):
+        with tab:
+            rows = buckets.get(track, [])
+            st.subheader(f"{track} ({len(rows)})")
+
+            if not rows:
+                if track == "Sales" and (not include_non_manager_sales):
+                    st.info("No sales-manager roles above your minimum score. Turn on ‘Sales: include non-manager roles’ to widen.")
+                else:
+                    st.info("No results above your minimum score right now. Try lowering it or removing keyword filter.")
+                continue
+
+            for m in rows[:60]:
+                left, right = st.columns([4, 1])
+                with left:
+                    st.markdown(f"### {m['Title']}")
+                    st.write(f"**{m['Company']}** — {m['Location']}  \n"
+                             f"*{m['Source']}* • {m['Date']}")
+                    if m.get("Why"):
+                        st.caption(f"Overlap keywords: {m['Why']}")
+                    st.link_button("Open job", m["URL"])
+                with right:
+                    st.metric("Match", f"{m['Score']}%")
+                st.divider()
 
     if show_diagnostics:
         st.subheader("Diagnostics")
@@ -576,8 +603,6 @@ if run:
         st.json(jp_detail_diag)
         st.write("Find a job (DWP) fetch:")
         st.json(dwp_diag)
-        st.write({"Total fetched (deduped)": len(all_jobs), "Displayed": len(matches)})
+        st.write({"Total fetched (deduped)": len(all_jobs)})
 
-st.caption(
-    "Sources: JobApplyNI (NI Job Centre Online) + Find a Job filtered to Northern Ireland."
-)
+st.caption("Sources: JobApplyNI + DWP Find a Job (Northern Ireland filter).")
